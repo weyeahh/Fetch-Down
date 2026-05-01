@@ -62,27 +62,33 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           path: dist/
           merge-multiple: true
 
-      - name: Publish rolling release
+      - name: Generate version tag
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="v$(date -u +%Y.%m.%d)-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: ${TAG}"
+
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="latest"
-          TITLE="Latest Build $(date -u +%Y-%m-%d\ %H:%M)"
-          BODY="Auto-built from \`${{ github.ref_name }}@${{ github.sha }}\`"
-
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag
-          fi
+          TAG="${{ steps.version.outputs.tag }}"
 
           gh release create "$TAG" dist/* \
             --repo "${{ github.repository }}" \
-            --title "$TITLE" \
-            --notes "$BODY" \
+            --title "$TAG" \
+            --notes "Commit: \`${{ github.sha }}\` on \`${{ github.ref_name }}\`" \
             --target "${{ github.sha }}" \
             --latest
+
+          echo "Release created: ${TAG}"
