@@ -486,6 +486,36 @@ func (c *Controller) downloadWorkerPool() {
 	wg.Wait()
 }
 
+func (c *Controller) downloadBudget() int64 {
+	windowUplink := c.collector.GetWindowTxBytes()
+	targetBytes := int64(float64(windowUplink) * c.cfg.CumulativeMultiplier)
+
+	dl := c.getDlStats()
+	c.stateMu.Lock()
+	wsb := c.windowStartBytes
+	c.stateMu.Unlock()
+
+	windowDownBytes := dl.GetTotalBytes() - wsb
+	if windowDownBytes < 0 {
+		windowDownBytes = 0
+	}
+
+	remaining := targetBytes - windowDownBytes
+	if remaining <= 0 {
+		return 0
+	}
+
+	workers := c.targetWorkers.Load()
+	if workers < 1 {
+		workers = 1
+	}
+	perWorker := remaining / int64(workers)
+	if perWorker < 4096 {
+		perWorker = 4096
+	}
+	return perWorker
+}
+
 func (c *Controller) worker(id int) {
 	for {
 		select {
@@ -504,6 +534,9 @@ func (c *Controller) worker(id int) {
 		}
 
 		dl := downloader.New(c.cfg, c.bucket, c.getDlStats())
+		if c.cfg.Mode == "traffic" {
+			dl.MaxBytes = c.downloadBudget()
+		}
 		result := dl.RunOnce()
 
 		if result.Error != nil && c.ctx.Err() == nil {

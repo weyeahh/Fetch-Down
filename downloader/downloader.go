@@ -33,6 +33,7 @@ type Downloader struct {
 	client   *http.Client
 	ctx      context.Context
 	cancel   context.CancelFunc
+	MaxBytes int64
 }
 
 func New(cfg *config.Config, bucket *limiter.TokenBucket, dlStats *stats.DownloadStats) *Downloader {
@@ -196,6 +197,10 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 		if n > 0 {
 			totalBytes += int64(n)
 			d.dlStats.AddBytes(int64(n))
+		}
+		if d.MaxBytes > 0 && totalBytes >= d.MaxBytes {
+			io.Copy(io.Discard, resp.Body)
+			break
 		}
 		if err != nil {
 			if err == io.EOF {
