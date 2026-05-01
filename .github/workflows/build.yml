@@ -73,12 +73,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="latest"
-          TITLE="Latest Build ($(date -u +%Y-%m-%d))"
+          TITLE="Latest Build $(date -u +%Y-%m-%d\ %H:%M)"
           BODY="Auto-built from \`${{ github.ref_name }}@${{ github.sha }}\`"
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber
-            gh release edit "$TAG" --repo "${{ github.repository }}" --title "$TITLE" --notes "$BODY"
-          else
-            gh release create "$TAG" dist/* --repo "${{ github.repository }}" --title "$TITLE" --notes "$BODY" --latest
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag
           fi
+
+          gh release create "$TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes "$BODY" \
+            --target "${{ github.sha }}" \
+            --latest
