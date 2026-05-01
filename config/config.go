@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -24,9 +26,8 @@ type Config struct {
 	MaxRetries           int           `yaml:"max_retries"`
 	StatsIntervalSec     int           `yaml:"stats_interval_sec"`
 
-	// 状态持久化
 	StateFile         string `yaml:"state_file"`
-	StateSaveInterval int    `yaml:"state_save_interval"` // 秒，0 表示仅退出时保存
+	StateSaveInterval int    `yaml:"state_save_interval"`
 
 	windowDurationParsed time.Duration `yaml:"-"`
 }
@@ -82,6 +83,20 @@ func (c *Config) validate() error {
 		return fmt.Errorf("download_urls must not be empty")
 	}
 
+	for i, rawURL := range c.DownloadURLs {
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			return fmt.Errorf("download_urls[%d] %q is not a valid URL: %w", i, rawURL, err)
+		}
+		scheme := strings.ToLower(parsed.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return fmt.Errorf("download_urls[%d] %q uses unsupported scheme %q, only http/https allowed", i, rawURL, scheme)
+		}
+		if parsed.Host == "" {
+			return fmt.Errorf("download_urls[%d] %q has empty host", i, rawURL)
+		}
+	}
+
 	if c.MaxConcurrent < 1 {
 		return fmt.Errorf("max_concurrent must be >= 1, got %d", c.MaxConcurrent)
 	}
@@ -124,7 +139,6 @@ func (c *Config) validate() error {
 		c.StatsIntervalSec = 10
 	}
 
-	// 状态持久化：累计模式下如果未设置 state_file，自动使用默认路径
 	if c.StateFile == "" && c.Mode == "cumulative" {
 		c.StateFile = "fetch-down-state.json"
 	}

@@ -1,22 +1,20 @@
 package limiter
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
-// TokenBucket implements a token bucket rate limiter for controlling download speed.
 type TokenBucket struct {
 	mu         sync.Mutex
-	tokens     float64   // current available tokens (bytes)
-	maxTokens  float64   // max tokens (burst size in bytes)
-	rate       float64   // tokens per second (bytes/sec), 0 = unlimited
+	tokens     float64
+	maxTokens  float64
+	rate       float64 // >0: rate-limited, 0: unlimited
 	lastRefill time.Time
+	stopped    bool
 }
 
-// NewTokenBucket creates a new rate limiter.
-// rate is in bytes per second, 0 means unlimited.
-// burstSize is the max burst in bytes (defaults to 1 second of rate if <= 0).
 func NewTokenBucket(rate float64, burstSize float64) *TokenBucket {
 	if rate <= 0 {
 		return &TokenBucket{
@@ -28,7 +26,7 @@ func NewTokenBucket(rate float64, burstSize float64) *TokenBucket {
 	}
 
 	if burstSize <= 0 {
-		burstSize = rate // 1 second burst
+		burstSize = rate * 0.5
 	}
 
 	return &TokenBucket{
@@ -39,39 +37,52 @@ func NewTokenBucket(rate float64, burstSize float64) *TokenBucket {
 	}
 }
 
-// SetRate updates the rate limit dynamically (bytes per second).
-// 0 means unlimited.
 func (tb *TokenBucket) SetRate(rate float64) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
 	if rate <= 0 {
 		tb.rate = 0
+		tb.stopped = false
 		return
 	}
 
+	tb.stopped = false
 	tb.rate = rate
-	tb.maxTokens = rate // 1 second burst
+	tb.maxTokens = rate * 0.5
 	if tb.tokens > tb.maxTokens {
 		tb.tokens = tb.maxTokens
 	}
 }
 
-// GetRate returns the current rate in bytes per second.
+func (tb *TokenBucket) Stop() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.stopped = true
+	tb.rate = 0
+	tb.maxTokens = 0
+	tb.tokens = 0
+}
+
+func (tb *TokenBucket) IsStopped() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.stopped
+}
+
 func (tb *TokenBucket) GetRate() float64 {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	return tb.rate
 }
 
-// Allow checks if n bytes can be consumed. If not, it waits until enough tokens
-// are available or returns false if the context is done.
-// Returns the actual amount allowed (may be less than n if partial is available).
 func (tb *TokenBucket) Allow(n int) int {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	// unlimited
+	if tb.stopped {
+		return 0
+	}
 	if tb.rate <= 0 {
 		return n
 	}
@@ -83,7 +94,6 @@ func (tb *TokenBucket) Allow(n int) int {
 		return n
 	}
 
-	// return what's available
 	available := int(tb.tokens)
 	if available <= 0 {
 		return 0
@@ -92,57 +102,95 @@ func (tb *TokenBucket) Allow(n int) int {
 	return available
 }
 
-// Wait blocks until n bytes worth of tokens are available.
-func (tb *TokenBucket) Wait(n int) {
+func (tb *TokenBucket) Wait(ctx context.Context, n int) {
 	tb.mu.Lock()
 
-	if tb.rate <= 0 {
-		tb.mu.Unlock()
-		return
-	}
+	for {
+		if tb.stopped {
+			tb.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			tb.mu.Lock()
+			continue
+		}
 
-	tb.refill()
+		if tb.rate <= 0 {
+			tb.mu.Unlock()
+			return
+		}
 
-	for tb.tokens < float64(n) {
+		tb.refill()
+
+		if tb.tokens >= float64(n) {
+			tb.tokens -= float64(n)
+			tb.mu.Unlock()
+			return
+		}
+
 		deficit := float64(n) - tb.tokens
 		waitTime := time.Duration(deficit/tb.rate*float64(time.Second)) + time.Millisecond
+		if waitTime > 500*time.Millisecond {
+			waitTime = 500 * time.Millisecond
+		}
 		tb.mu.Unlock()
-		time.Sleep(waitTime)
-		tb.mu.Lock()
-		tb.refill()
-	}
 
-	tb.tokens -= float64(n)
-	tb.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(waitTime):
+		}
+
+		tb.mu.Lock()
+	}
 }
 
-// WaitN blocks until n bytes worth of tokens are available, returning the wait duration.
-func (tb *TokenBucket) WaitN(n int) time.Duration {
+func (tb *TokenBucket) WaitN(ctx context.Context, n int) time.Duration {
 	tb.mu.Lock()
 
-	if tb.rate <= 0 {
-		tb.mu.Unlock()
-		return 0
-	}
-
-	tb.refill()
-
 	start := time.Now()
-	for tb.tokens < float64(n) {
+
+	for {
+		if tb.stopped {
+			tb.mu.Unlock()
+			return time.Since(start)
+		}
+		if tb.rate <= 0 {
+			tb.mu.Unlock()
+			return time.Since(start)
+		}
+
+		tb.refill()
+
+		if tb.tokens >= float64(n) {
+			tb.tokens -= float64(n)
+			tb.mu.Unlock()
+			return time.Since(start)
+		}
+
 		deficit := float64(n) - tb.tokens
 		waitTime := time.Duration(deficit/tb.rate*float64(time.Second)) + time.Millisecond
+		if waitTime > 500*time.Millisecond {
+			waitTime = 500 * time.Millisecond
+		}
 		tb.mu.Unlock()
-		time.Sleep(waitTime)
-		tb.mu.Lock()
-		tb.refill()
-	}
 
-	tb.tokens -= float64(n)
-	tb.mu.Unlock()
-	return time.Since(start)
+		select {
+		case <-ctx.Done():
+			return time.Since(start)
+		case <-time.After(waitTime):
+		}
+
+		tb.mu.Lock()
+	}
 }
 
 func (tb *TokenBucket) refill() {
+	if tb.rate <= 0 {
+		return
+	}
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
 	tb.lastRefill = now

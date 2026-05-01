@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -16,36 +18,52 @@ import (
 )
 
 type DownloadResult struct {
-	Bytes     int64
-	Duration  time.Duration
+	Bytes      int64
+	Duration   time.Duration
 	StatusCode int
-	URL       string
-	Error     error
+	URL        string
+	Error      error
 }
 
 type Downloader struct {
-	cfg       *config.Config
-	limiter   *limiter.TokenBucket
-	dlStats   *stats.DownloadStats
-	urlIndex  atomic.Int64
-	client    *http.Client
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg      *config.Config
+	limiter  *limiter.TokenBucket
+	dlStats  *stats.DownloadStats
+	urlIndex atomic.Int64
+	client   *http.Client
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func New(cfg *config.Config, bucket *limiter.TokenBucket, dlStats *stats.DownloadStats) *Downloader {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	connectTimeout := time.Duration(cfg.ConnectTimeoutSec) * time.Second
 
 	transport := &http.Transport{
 		MaxIdleConns:        cfg.MaxConcurrent * 2,
 		MaxIdleConnsPerHost: cfg.MaxConcurrent * 2,
 		IdleConnTimeout:     30 * time.Second,
 		DisableCompression:  true,
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: connectTimeout,
 	}
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   time.Duration(cfg.ReadTimeoutSec) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			scheme := req.URL.Scheme
+			if scheme != "http" && scheme != "https" {
+				return fmt.Errorf("redirect to unsupported scheme %q", scheme)
+			}
+			return nil
+		},
 	}
 
 	return &Downloader{
@@ -70,7 +88,6 @@ func (d *Downloader) nextURL() string {
 	return d.cfg.DownloadURLs[int(idx)%len(d.cfg.DownloadURLs)]
 }
 
-// RunOnce performs a single download with retry logic.
 func (d *Downloader) RunOnce() DownloadResult {
 	url := d.nextURL()
 
@@ -83,7 +100,9 @@ func (d *Downloader) RunOnce() DownloadResult {
 		}
 
 		if attempt > 0 {
-			backoff := time.Duration(math.Pow(2, float64(attempt-1))*float64(time.Second))
+			baseBackoff := math.Pow(2, float64(attempt-1)) * float64(time.Second)
+			jitter := rand.Float64() * 0.5 * baseBackoff
+			backoff := time.Duration(baseBackoff + jitter)
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
 			}
@@ -116,10 +135,7 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(d.ctx, time.Duration(d.cfg.ReadTimeoutSec)*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(d.ctx, http.MethodGet, url, nil)
 	if err != nil {
 		d.dlStats.IncrFailed()
 		return DownloadResult{Error: fmt.Errorf("create request: %w", err), URL: url}
@@ -135,6 +151,7 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		io.Copy(io.Discard, resp.Body)
 		d.dlStats.IncrFailed()
 		return DownloadResult{
 			Error:      fmt.Errorf("unexpected status code: %d", resp.StatusCode),
@@ -143,28 +160,36 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 		}
 	}
 
-	// Read with rate limiting, discard content
 	var totalBytes int64
-	buf := make([]byte, 32*1024) // 32KB buffer
+	buf := make([]byte, 4*1024)
 
 	for {
-		select {
-		case <-ctx.Done():
+		if d.ctx.Err() != nil {
+			if totalBytes > 0 {
+				io.Copy(io.Discard, resp.Body)
+			}
 			d.dlStats.IncrFailed()
 			return DownloadResult{
-				Bytes:     totalBytes,
-				Duration:  time.Since(start),
+				Bytes:      totalBytes,
+				Duration:   time.Since(start),
 				StatusCode: resp.StatusCode,
-				Error:     ctx.Err(),
-				URL:       url,
+				Error:      d.ctx.Err(),
+				URL:        url,
 			}
-		default:
 		}
 
-		// Rate limit: wait for tokens before reading
-		readSize := len(buf)
 		if d.limiter != nil {
-			d.limiter.Wait(readSize)
+			d.limiter.Wait(d.ctx, len(buf))
+			if d.ctx.Err() != nil {
+				d.dlStats.IncrFailed()
+				return DownloadResult{
+					Bytes:      totalBytes,
+					Duration:   time.Since(start),
+					StatusCode: resp.StatusCode,
+					Error:      d.ctx.Err(),
+					URL:        url,
+				}
+			}
 		}
 
 		n, err := resp.Body.Read(buf)
@@ -176,23 +201,23 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 			if err == io.EOF {
 				break
 			}
-			// context canceled or deadline exceeded
 			if d.ctx.Err() != nil {
+				d.dlStats.IncrFailed()
 				return DownloadResult{
-					Bytes:     totalBytes,
-					Duration:  time.Since(start),
+					Bytes:      totalBytes,
+					Duration:   time.Since(start),
 					StatusCode: resp.StatusCode,
-					Error:     d.ctx.Err(),
-					URL:       url,
+					Error:      d.ctx.Err(),
+					URL:        url,
 				}
 			}
 			d.dlStats.IncrFailed()
 			return DownloadResult{
-				Bytes:     totalBytes,
-				Duration:  time.Since(start),
+				Bytes:      totalBytes,
+				Duration:   time.Since(start),
 				StatusCode: resp.StatusCode,
-				Error:     fmt.Errorf("read body: %w", err),
-				URL:       url,
+				Error:      fmt.Errorf("read body: %w", err),
+				URL:        url,
 			}
 		}
 	}
@@ -200,18 +225,20 @@ func (d *Downloader) doDownload(url string) DownloadResult {
 	d.dlStats.IncrSuccess()
 	duration := time.Since(start)
 
-	rate := float64(totalBytes) / duration.Seconds()
-	logger.Info("Download complete: %s | %s in %v | %s",
-		url,
-		d.dlStats.FormatBytes(totalBytes),
-		duration.Round(time.Millisecond),
-		d.dlStats.FormatRate(rate),
-	)
+	if duration.Seconds() > 0 {
+		rate := float64(totalBytes) / duration.Seconds()
+		logger.Info("Download complete: %s | %s in %v | %s",
+			url,
+			d.dlStats.FormatBytes(totalBytes),
+			duration.Round(time.Millisecond),
+			d.dlStats.FormatRate(rate),
+		)
+	}
 
 	return DownloadResult{
-		Bytes:     totalBytes,
-		Duration:  duration,
+		Bytes:      totalBytes,
+		Duration:   duration,
 		StatusCode: resp.StatusCode,
-		URL:       url,
+		URL:        url,
 	}
 }

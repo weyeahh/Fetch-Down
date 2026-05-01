@@ -18,19 +18,22 @@ import (
 type Controller struct {
 	cfg       *config.Config
 	collector *collector.Stats
-	dlStats   *stats.DownloadStats
 	bucket    *limiter.TokenBucket
 	stateMgr  *state.Manager
+
+	dlStatsMu sync.RWMutex
+	dlStats   *stats.DownloadStats
+
+	stateMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// 累计模式专用
 	windowStart       time.Time
+	windowStartBytes  int64
 	windowTargetBytes atomic.Int64
 	windowConsumed    atomic.Int64
 
-	// worker 数量管理
 	activeWorkers atomic.Int32
 	targetWorkers atomic.Int32
 
@@ -41,15 +44,16 @@ func New(cfg *config.Config, coll *collector.Stats, dlStats *stats.DownloadStats
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Controller{
-		cfg:         cfg,
-		collector:   coll,
-		dlStats:     dlStats,
-		bucket:      bucket,
-		stateMgr:    stateMgr,
-		ctx:         ctx,
-		cancel:      cancel,
-		windowStart: time.Now(),
-		done:        make(chan struct{}),
+		cfg:              cfg,
+		collector:        coll,
+		dlStats:          dlStats,
+		bucket:           bucket,
+		stateMgr:         stateMgr,
+		ctx:              ctx,
+		cancel:           cancel,
+		windowStart:      time.Now(),
+		windowStartBytes: 0,
+		done:             make(chan struct{}),
 	}
 
 	c.targetWorkers.Store(int32(cfg.MaxConcurrent))
@@ -57,58 +61,78 @@ func New(cfg *config.Config, coll *collector.Stats, dlStats *stats.DownloadStats
 	return c
 }
 
-// RestoreState 从持久化状态恢复运行现场
+func (c *Controller) getDlStats() *stats.DownloadStats {
+	c.dlStatsMu.RLock()
+	defer c.dlStatsMu.RUnlock()
+	return c.dlStats
+}
+
+func (c *Controller) setDlStats(s *stats.DownloadStats) {
+	c.dlStatsMu.Lock()
+	defer c.dlStatsMu.Unlock()
+	c.dlStats = s
+}
+
 func (c *Controller) RestoreState(s *state.PersistedState) {
 	if s == nil {
 		return
 	}
 
-	logger.Info("从持久化状态恢复: saved_at=%s, mode=%s", s.SavedAt.Format("2006-01-02 15:04:05"), s.Mode)
+	logger.Info("Restoring from persisted state: saved_at=%s, mode=%s", s.SavedAt.Format("2006-01-02 15:04:05"), s.Mode)
 
-	// 恢复下载统计
-	c.dlStats.LoadFromState(s.TotalBytesDown, s.SuccessRequests, s.FailedRequests, s.TotalRequests)
+	dl := c.getDlStats()
+	dl.LoadFromState(s.TotalBytesDown, s.SuccessRequests, s.FailedRequests, s.TotalRequests)
+
+	c.collector.SetTotalTxBytesBase(s.TotalBytesUp)
 
 	if s.Mode == "cumulative" {
-		// 检查窗口是否仍有效
 		windowDur := c.cfg.WindowDurationParsed()
 		elapsed := time.Since(s.WindowStart)
 
 		if elapsed < windowDur {
-			// 窗口仍然有效，恢复窗口状态
+			c.stateMu.Lock()
 			c.windowStart = s.WindowStart
-			logger.Info("窗口仍在有效期内: 已过 %s, 剩余 %s",
+			c.windowStartBytes = s.TotalBytesDown
+			c.stateMu.Unlock()
+
+			logger.Info("Window still valid: elapsed %s, remaining %s",
 				elapsed.Round(time.Second),
 				(windowDur - elapsed).Round(time.Second))
 
-			// 恢复 collector 的窗口累计上行字节数
 			c.collector.SetWindowTxBytesBase(s.WindowTxBytesAtStart)
 		} else {
-			// 窗口已过期，重置
-			logger.Info("窗口已过期 (过了 %s)，将重新开始", elapsed.Round(time.Second))
+			logger.Info("Window expired (elapsed %s), starting fresh", elapsed.Round(time.Second))
+			c.stateMu.Lock()
 			c.windowStart = time.Now()
+			c.windowStartBytes = 0
+			c.stateMu.Unlock()
 			c.collector.ResetWindow()
 		}
 	}
 }
 
-// BuildState 构建当前状态快照用于持久化
 func (c *Controller) BuildState() *state.PersistedState {
+	c.stateMu.Lock()
+	ws := c.windowStart
+	c.stateMu.Unlock()
+
+	dl := c.getDlStats()
+
 	return &state.PersistedState{
 		Mode:                 c.cfg.Mode,
-		WindowStart:          c.windowStart,
-		TotalBytesDown:       c.dlStats.GetTotalBytes(),
+		WindowStart:          ws,
+		TotalBytesDown:       dl.GetTotalBytes(),
 		TotalBytesUp:         c.collector.GetTotalTxBytes(),
 		WindowTxBytesAtStart: c.collector.GetWindowTxBytes(),
-		SuccessRequests:      c.dlStats.GetSuccessRequests(),
-		FailedRequests:       c.dlStats.GetFailedRequests(),
-		TotalRequests:        c.dlStats.GetTotalRequests(),
+		SuccessRequests:      dl.GetSuccessRequests(),
+		FailedRequests:       dl.GetFailedRequests(),
+		TotalRequests:        dl.GetTotalRequests(),
 		InterfaceName:        c.collector.Interface(),
 		WindowDuration:       c.cfg.WindowDuration,
 	}
 }
 
 func (c *Controller) Start() {
-	// 启动自动保存
 	if c.stateMgr != nil {
 		c.stateMgr.StartAutoSave(c.BuildState)
 	}
@@ -129,15 +153,13 @@ func (c *Controller) Start() {
 	<-c.done
 }
 
-// SaveAndStop 保存状态后优雅退出
 func (c *Controller) SaveAndStop() {
-	// 先保存当前状态
 	if c.stateMgr != nil {
 		if s := c.BuildState(); s != nil {
 			if err := c.stateMgr.Save(s); err != nil {
-				logger.Warn("退出时保存状态失败: %v", err)
+				logger.Warn("Failed to save state on exit: %v", err)
 			} else {
-				logger.Info("退出状态已保存到 %s", c.stateMgr.FilePath())
+				logger.Info("Exit state saved to %s", c.stateMgr.FilePath())
 			}
 			c.stateMgr.Stop()
 		}
@@ -177,13 +199,19 @@ func (c *Controller) controlLoop() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("controlLoop panic: %v", r)
+		}
+		close(c.done)
+	}()
+
 	for {
 		select {
 		case <-c.ctx.Done():
-			close(c.done)
 			return
 		case <-ticker.C:
-			c.dlStats.UpdateRate()
+			c.getDlStats().UpdateRate()
 		}
 	}
 }
@@ -205,11 +233,12 @@ func (c *Controller) statsReporter() {
 
 func (c *Controller) printStats() {
 	bw := c.collector.GetBandwidth()
-	totalRx := c.dlStats.GetTotalBytes()
+	dl := c.getDlStats()
+	totalRx := dl.GetTotalBytes()
 	totalUplink := c.collector.GetTotalTxBytes()
-	rate := c.dlStats.GetRate()
-	active := c.dlStats.GetActive()
-	uptime := c.dlStats.Uptime()
+	rate := dl.GetRate()
+	active := dl.GetActive()
+	uptime := dl.Uptime()
 
 	switch c.cfg.Mode {
 	case "ratio":
@@ -217,20 +246,25 @@ func (c *Controller) printStats() {
 		if bw.TxBps > 0 {
 			currentRatio = bw.RxBps / bw.TxBps
 		}
+		staleIndicator := ""
+		if c.collector.IsStale() {
+			staleIndicator = " [STALE]"
+		}
 		logger.Info(
-			"[STATS] mode=ratio | uptime=%s | up=%s down=%s | ratio=%.2f (target=%.2f) | dl_rate=%s | total_down=%s total_up=%s | workers=%d/%d | success=%d failed=%d",
+			"[STATS] mode=ratio | uptime=%s | up=%s down=%s%s | ratio=%.2f (target=%.2f) | dl_rate=%s | total_down=%s total_up=%s | workers=%d/%d | success=%d failed=%d",
 			uptime.Round(time.Second),
-			c.dlStats.FormatRate(bw.TxBps),
-			c.dlStats.FormatRate(bw.RxBps),
+			dl.FormatRate(bw.TxBps),
+			dl.FormatRate(bw.RxBps),
+			staleIndicator,
 			currentRatio,
 			c.cfg.Ratio,
-			c.dlStats.FormatRate(rate),
-			c.dlStats.FormatBytes(totalRx),
-			c.dlStats.FormatBytes(int64(totalUplink)),
+			dl.FormatRate(rate),
+			dl.FormatBytes(totalRx),
+			dl.FormatBytes(int64(totalUplink)),
 			active,
 			c.targetWorkers.Load(),
-			c.dlStats.GetSuccessRequests(),
-			c.dlStats.GetFailedRequests(),
+			dl.GetSuccessRequests(),
+			dl.GetFailedRequests(),
 		)
 
 	case "cumulative":
@@ -238,30 +272,44 @@ func (c *Controller) printStats() {
 		targetBytes := c.windowTargetBytes.Load()
 		remaining := c.windowDurationRemaining()
 
+		c.stateMu.Lock()
+		wsb := c.windowStartBytes
+		c.stateMu.Unlock()
+
+		windowDownBytes := totalRx - wsb
+		if windowDownBytes < 0 {
+			windowDownBytes = 0
+		}
+
 		var progress float64
 		if targetBytes > 0 {
-			progress = float64(totalRx) / float64(targetBytes) * 100
+			progress = float64(windowDownBytes) / float64(targetBytes) * 100
 		}
 
 		logger.Info(
-			"[STATS] mode=cumulative | uptime=%s | window_remaining=%s | window_uplink=%s | target_down=%s (%.1f%%) | dl_rate=%s | total_down=%s | workers=%d/%d | success=%d failed=%d",
+			"[STATS] mode=cumulative | uptime=%s | window_remaining=%s | window_uplink=%s | target_down=%s (%.1f%%) | dl_rate=%s | window_down=%s total_down=%s | workers=%d/%d | success=%d failed=%d",
 			uptime.Round(time.Second),
 			remaining.Round(time.Second),
-			c.dlStats.FormatBytes(int64(windowUplink)),
-			c.dlStats.FormatBytes(targetBytes),
+			dl.FormatBytes(int64(windowUplink)),
+			dl.FormatBytes(targetBytes),
 			progress,
-			c.dlStats.FormatRate(rate),
-			c.dlStats.FormatBytes(totalRx),
+			dl.FormatRate(rate),
+			dl.FormatBytes(windowDownBytes),
+			dl.FormatBytes(totalRx),
 			active,
 			c.targetWorkers.Load(),
-			c.dlStats.GetSuccessRequests(),
-			c.dlStats.GetFailedRequests(),
+			dl.GetSuccessRequests(),
+			dl.GetFailedRequests(),
 		)
 	}
 }
 
 func (c *Controller) windowDurationRemaining() time.Duration {
-	elapsed := time.Since(c.windowStart)
+	c.stateMu.Lock()
+	ws := c.windowStart
+	c.stateMu.Unlock()
+
+	elapsed := time.Since(ws)
 	remaining := c.cfg.WindowDurationParsed() - elapsed
 	if remaining < 0 {
 		remaining = 0
@@ -269,7 +317,6 @@ func (c *Controller) windowDurationRemaining() time.Duration {
 	return remaining
 }
 
-// ratioMode 实时比例模式：动态调整下载带宽以维持上/下行比例
 func (c *Controller) ratioMode() {
 	interval := time.Duration(c.cfg.UplinkSampleInterval) * time.Second
 	ticker := time.NewTicker(interval)
@@ -277,12 +324,19 @@ func (c *Controller) ratioMode() {
 
 	const smoothingFactor = 0.3
 
+	var smoothedRate float64
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
 			bw := c.collector.GetBandwidth()
+
+			if c.collector.IsStale() {
+				logger.Debug("Ratio mode: collector stale, keeping current rate")
+				continue
+			}
 
 			targetDownBps := bw.TxBps * c.cfg.Ratio
 
@@ -293,29 +347,40 @@ func (c *Controller) ratioMode() {
 				}
 			}
 
-			currentRate := c.bucket.GetRate()
-			if currentRate > 0 {
-				newRate := currentRate*(1-smoothingFactor) + targetDownBps*smoothingFactor
-				c.bucket.SetRate(newRate)
+			if targetDownBps < 1 {
+				if smoothedRate > 0 {
+					smoothedRate = smoothedRate * (1 - smoothingFactor)
+				}
+				if smoothedRate < 1 {
+					c.bucket.Stop()
+					c.targetWorkers.Store(0)
+					logger.Debug("Ratio mode: uplink near zero, stopping downloads")
+					continue
+				}
 			} else {
-				c.bucket.SetRate(targetDownBps)
+				if smoothedRate > 0 {
+					smoothedRate = smoothedRate*(1-smoothingFactor) + targetDownBps*smoothingFactor
+				} else {
+					smoothedRate = targetDownBps
+				}
 			}
 
-			if targetDownBps < 100*1024 {
+			c.bucket.SetRate(smoothedRate)
+
+			if smoothedRate < 100*1024 {
 				c.targetWorkers.Store(1)
-			} else if targetDownBps < 1024*1024 {
+			} else if smoothedRate < 1024*1024 {
 				c.targetWorkers.Store(min(2, int32(c.cfg.MaxConcurrent)))
 			} else {
 				c.targetWorkers.Store(int32(c.cfg.MaxConcurrent))
 			}
 
-			logger.Debug("Ratio mode: up=%.0f B/s, target_down=%.0f B/s, actual_limit=%.0f B/s, workers=%d",
-				bw.TxBps, targetDownBps, c.bucket.GetRate(), c.targetWorkers.Load())
+			logger.Debug("Ratio mode: up=%.0f B/s, target_down=%.0f B/s, smoothed=%.0f B/s, workers=%d",
+				bw.TxBps, targetDownBps, smoothedRate, c.targetWorkers.Load())
 		}
 	}
 }
 
-// cumulativeMode 累计流量模式：窗口内入网 = 出网 × 倍数
 func (c *Controller) cumulativeMode() {
 	interval := time.Duration(c.cfg.UplinkSampleInterval) * time.Second
 	ticker := time.NewTicker(interval)
@@ -327,7 +392,7 @@ func (c *Controller) cumulativeMode() {
 			return
 		case <-ticker.C:
 			if c.windowDurationRemaining() <= 0 {
-				logger.Info("窗口到期，重置...")
+				logger.Info("Window expired, resetting...")
 				c.resetWindow()
 				continue
 			}
@@ -336,7 +401,17 @@ func (c *Controller) cumulativeMode() {
 			targetBytes := int64(float64(windowUplink) * c.cfg.CumulativeMultiplier)
 			c.windowTargetBytes.Store(targetBytes)
 
-			remaining := targetBytes - c.dlStats.GetTotalBytes()
+			dl := c.getDlStats()
+			c.stateMu.Lock()
+			wsb := c.windowStartBytes
+			c.stateMu.Unlock()
+
+			windowDownBytes := dl.GetTotalBytes() - wsb
+			if windowDownBytes < 0 {
+				windowDownBytes = 0
+			}
+
+			remaining := targetBytes - windowDownBytes
 			if remaining <= 0 {
 				c.bucket.SetRate(1024)
 				c.targetWorkers.Store(1)
@@ -367,32 +442,36 @@ func (c *Controller) cumulativeMode() {
 				c.targetWorkers.Store(int32(c.cfg.MaxConcurrent))
 			}
 
-			logger.Debug("Cumulative: window_uplink=%d, target=%d, remaining=%d, rate=%.0f B/s, time_left=%v",
-				windowUplink, targetBytes, remaining, requiredRate, c.windowDurationRemaining().Round(time.Second))
+			logger.Debug("Cumulative: window_uplink=%d, target=%d, window_down=%d, remaining=%d, rate=%.0f B/s, time_left=%v",
+				windowUplink, targetBytes, windowDownBytes, remaining, requiredRate, c.windowDurationRemaining().Round(time.Second))
 		}
 	}
 }
 
 func (c *Controller) resetWindow() {
+	newDl := stats.NewDownloadStats()
+
+	c.stateMu.Lock()
 	c.windowStart = time.Now()
+	c.windowStartBytes = 0
+	c.stateMu.Unlock()
+
+	c.setDlStats(newDl)
 	c.collector.ResetWindow()
 	c.windowTargetBytes.Store(0)
 	c.windowConsumed.Store(0)
-	c.dlStats = stats.NewDownloadStats()
 
-	// 重置后立即保存一次状态
 	if c.stateMgr != nil {
 		if s := c.BuildState(); s != nil {
 			if err := c.stateMgr.Save(s); err != nil {
-				logger.Warn("窗口重置后保存状态失败: %v", err)
+				logger.Warn("Failed to save state after window reset: %v", err)
 			}
 		}
 	}
 
-	logger.Info("窗口重置完成")
+	logger.Info("Window reset complete")
 }
 
-// downloadWorkerPool 管理并发下载 worker 协程池
 func (c *Controller) downloadWorkerPool() {
 	var wg sync.WaitGroup
 
@@ -416,15 +495,19 @@ func (c *Controller) worker(id int) {
 		}
 
 		if int32(id) >= c.targetWorkers.Load() {
-			time.Sleep(time.Second)
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 
-		dl := downloader.New(c.cfg, c.bucket, c.dlStats)
+		dl := downloader.New(c.cfg, c.bucket, c.getDlStats())
 		result := dl.RunOnce()
 
 		if result.Error != nil && c.ctx.Err() == nil {
-			logger.Warn("Worker %d: 下载错误: %v", id, result.Error)
+			logger.Warn("Worker %d: download error: %v", id, result.Error)
 		}
 
 		select {
@@ -433,11 +516,4 @@ func (c *Controller) worker(id int) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-}
-
-func min(a, b int32) int32 {
-	if a < b {
-		return a
-	}
-	return b
 }

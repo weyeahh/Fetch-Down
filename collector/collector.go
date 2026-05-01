@@ -14,16 +14,16 @@ import (
 )
 
 type Sample struct {
-	Timestamp  time.Time
-	RxBytes    uint64
-	TxBytes    uint64
-	RxPackets  uint64
-	TxPackets  uint64
+	Timestamp time.Time
+	RxBytes   uint64
+	TxBytes   uint64
+	RxPackets uint64
+	TxPackets uint64
 }
 
 type Bandwidth struct {
-	RxBps float64 // bytes per second (downlink)
-	TxBps float64 // bytes per second (uplink)
+	RxBps float64
+	TxBps float64
 }
 
 type Stats struct {
@@ -31,27 +31,23 @@ type Stats struct {
 
 	iface string
 
-	// cumulative counters (from system boot)
-	lastSample   Sample
+	lastSample    Sample
 	currentSample Sample
 
-	// program-lifetime tracking
-	startSample    Sample
-	totalRxBytes   uint64 // total downlink since program start
-	totalTxBytes   uint64 // total uplink since program start
+	startSample  Sample
+	totalRxBytes uint64
+	totalTxBytes uint64
 
-	// real-time bandwidth
 	currentBandwidth Bandwidth
+	stale            bool
 
-	// window tracking for cumulative mode
 	windowStartSample Sample
-	windowTxBytes     uint64 // total uplink bytes in current window
+	windowTxBytes     uint64
 }
 
 func New(iface string) (*Stats, error) {
 	s, err := sampleInterface(iface)
 	if err != nil {
-		// fallback: try to auto-detect
 		iface, err = detectInterface()
 		if err != nil {
 			return nil, fmt.Errorf("detect network interface: %w", err)
@@ -83,14 +79,12 @@ func detectInterface() (string, error) {
 		if iface.Name == "lo" || iface.Name == "Loopback" {
 			continue
 		}
-		// try to read stats for this interface
 		_, err := sampleInterface(iface.Name)
 		if err == nil {
 			return iface.Name, nil
 		}
 	}
 
-	// fallback: try reading /proc/net/dev for first non-lo interface
 	return detectFromProcNetDev()
 }
 
@@ -117,13 +111,11 @@ func detectFromProcNetDev() (string, error) {
 }
 
 func sampleInterface(iface string) (Sample, error) {
-	// Try /proc/net/dev first (Linux)
 	s, err := sampleFromProcNetDev(iface)
 	if err == nil {
 		return s, nil
 	}
 
-	// Fallback to gopsutil
 	counters, err := net.IOCounters(true)
 	if err != nil {
 		return Sample{}, fmt.Errorf("gopsutil IOCounters: %w", err)
@@ -170,49 +162,86 @@ func sampleFromProcNetDev(iface string) (Sample, error) {
 
 		var s Sample
 		s.Timestamp = time.Now()
-		fmt.Sscanf(fields[0], "%d", &s.RxBytes)
-		fmt.Sscanf(fields[1], "%d", &s.RxPackets)
-		fmt.Sscanf(fields[8], "%d", &s.TxBytes)
-		fmt.Sscanf(fields[9], "%d", &s.TxPackets)
+
+		if _, err := fmt.Sscanf(fields[0], "%d", &s.RxBytes); err != nil {
+			return Sample{}, fmt.Errorf("parse rx_bytes for %s: %w", iface, err)
+		}
+		if _, err := fmt.Sscanf(fields[1], "%d", &s.RxPackets); err != nil {
+			return Sample{}, fmt.Errorf("parse rx_packets for %s: %w", iface, err)
+		}
+		if _, err := fmt.Sscanf(fields[8], "%d", &s.TxBytes); err != nil {
+			return Sample{}, fmt.Errorf("parse tx_bytes for %s: %w", iface, err)
+		}
+		if _, err := fmt.Sscanf(fields[9], "%d", &s.TxPackets); err != nil {
+			return Sample{}, fmt.Errorf("parse tx_packets for %s: %w", iface, err)
+		}
 		return s, nil
 	}
 
 	return Sample{}, fmt.Errorf("interface %q not found in /proc/net/dev", iface)
 }
 
-// Update samples the interface and updates bandwidth calculations.
 func (st *Stats) Update() {
 	s, err := sampleInterface(st.iface)
 	if err != nil {
 		logger.Warn("Failed to sample interface %s: %v", st.iface, err)
+		st.mu.Lock()
+		st.stale = true
+		st.mu.Unlock()
 		return
 	}
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	st.stale = false
 	st.lastSample = st.currentSample
 	st.currentSample = s
 
-	// calculate bandwidth (bytes/sec)
 	dt := s.Timestamp.Sub(st.lastSample.Timestamp).Seconds()
 	if dt > 0 {
-		st.currentBandwidth.RxBps = float64(s.RxBytes-st.lastSample.RxBytes) / dt
-		st.currentBandwidth.TxBps = float64(s.TxBytes-st.lastSample.TxBytes) / dt
+		if s.RxBytes >= st.lastSample.RxBytes {
+			st.currentBandwidth.RxBps = float64(s.RxBytes-st.lastSample.RxBytes) / dt
+		} else {
+			st.currentBandwidth.RxBps = 0
+		}
+		if s.TxBytes >= st.lastSample.TxBytes {
+			st.currentBandwidth.TxBps = float64(s.TxBytes-st.lastSample.TxBytes) / dt
+		} else {
+			st.currentBandwidth.TxBps = 0
+			logger.Warn("TX counter wrap detected: current=%d, previous=%d", s.TxBytes, st.lastSample.TxBytes)
+		}
 	}
 
-	// update total since program start
 	if s.RxBytes >= st.startSample.RxBytes {
 		st.totalRxBytes = s.RxBytes - st.startSample.RxBytes
-	}
-	if s.TxBytes >= st.startSample.TxBytes {
-		st.totalTxBytes = s.TxBytes - st.startSample.TxBytes
+	} else {
+		logger.Warn("RX counter wrap detected relative to start, resetting baseline")
+		st.startSample.RxBytes = s.RxBytes
+		st.totalRxBytes = 0
 	}
 
-	// update window tx bytes
+	if s.TxBytes >= st.startSample.TxBytes {
+		st.totalTxBytes = s.TxBytes - st.startSample.TxBytes
+	} else {
+		logger.Warn("TX counter wrap detected relative to start, resetting baseline")
+		st.startSample.TxBytes = s.TxBytes
+		st.totalTxBytes = 0
+	}
+
 	if s.TxBytes >= st.windowStartSample.TxBytes {
 		st.windowTxBytes = s.TxBytes - st.windowStartSample.TxBytes
+	} else {
+		logger.Warn("TX counter wrap detected relative to window start, resetting window baseline")
+		st.windowStartSample.TxBytes = s.TxBytes
+		st.windowTxBytes = 0
 	}
+}
+
+func (st *Stats) IsStale() bool {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.stale
 }
 
 func (st *Stats) GetBandwidth() Bandwidth {
@@ -256,28 +285,19 @@ func (st *Stats) Interface() string {
 	return st.iface
 }
 
-// SetWindowTxBytesBase 注入持久化的窗口累计上行字节数（重启恢复用）
-// 当程序重启时，系统 /proc/net/dev 的计数器不会归零，
-// 因此需要记录重启时刻的系统基准值，加上之前窗口内已累计的字节数
 func (st *Stats) SetWindowTxBytesBase(persistedWindowTxBytes uint64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// 记录当前系统 tx 作为新的窗口起点，但将之前累计的值保存下来
-	// 这样 windowTxBytes = (当前系统tx - windowStartSample.tx) + persistedWindowTxBytes
-	// 通过调整 windowStartSample 来实现：
-	// 令 windowStartSample.TxBytes = 当前系统tx - persistedWindowTxBytes
-	// 这样 windowTxBytes = 当前系统tx - (当前系统tx - persistedWindowTxBytes) = persistedWindowTxBytes
 	currentTx := st.currentSample.TxBytes
 	if currentTx >= persistedWindowTxBytes {
 		st.windowStartSample.TxBytes = currentTx - persistedWindowTxBytes
 	}
 	st.windowTxBytes = persistedWindowTxBytes
 
-	logger.Info("恢复窗口累计上行: %d bytes (系统tx基准=%d)", persistedWindowTxBytes, st.windowStartSample.TxBytes)
+	logger.Info("Restored window TX base: %d bytes (system tx baseline=%d)", persistedWindowTxBytes, st.windowStartSample.TxBytes)
 }
 
-// SetTotalTxBytesBase 注入持久化的程序生命周期累计上行字节数
 func (st *Stats) SetTotalTxBytesBase(persistedTotalTxBytes uint64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -288,5 +308,5 @@ func (st *Stats) SetTotalTxBytesBase(persistedTotalTxBytes uint64) {
 	}
 	st.totalTxBytes = persistedTotalTxBytes
 
-	logger.Info("恢复累计上行: %d bytes (系统tx基准=%d)", persistedTotalTxBytes, st.startSample.TxBytes)
+	logger.Info("Restored total TX base: %d bytes (system tx baseline=%d)", persistedTotalTxBytes, st.startSample.TxBytes)
 }

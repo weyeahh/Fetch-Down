@@ -56,7 +56,6 @@ func main() {
 			cfg.CumulativeMultiplier, cfg.WindowDuration)
 	}
 
-	// 初始化状态管理器
 	var stateMgr *state.Manager
 	if cfg.StateFile != "" {
 		stateMgr = state.NewManager(cfg.StateFile, cfg.StateSaveIntervalParsed())
@@ -65,15 +64,14 @@ func main() {
 
 	ctrl := controller.New(cfg, coll, dlStats, bucket, stateMgr)
 
-	// 加载持久化状态
 	if stateMgr != nil {
 		savedState, err := stateMgr.Load()
 		if err != nil {
-			logger.Warn("加载状态文件失败: %v", err)
+			logger.Warn("Failed to load state file: %v", err)
 		} else if savedState != nil {
 			ctrl.RestoreState(savedState)
 		} else {
-			logger.Info("无持久化状态文件，全新启动")
+			logger.Info("No persisted state file, fresh start")
 		}
 	}
 
@@ -84,7 +82,6 @@ func main() {
 		sig := <-sigCh
 		logger.Info("Received signal: %v, shutting down...", sig)
 
-		// 保存状态后退出
 		ctrl.SaveAndStop()
 
 		logger.Info("=== Final Statistics ===")
@@ -93,8 +90,6 @@ func main() {
 			dlStats.GetTotalRequests(), dlStats.GetSuccessRequests(), dlStats.GetFailedRequests())
 		logger.Info("Uptime: %s", dlStats.Uptime())
 		logger.Info("=== Shutdown complete ===")
-
-		os.Exit(0)
 	}()
 
 	ctrl.Start()
