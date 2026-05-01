@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"fetch-down/config"
@@ -29,7 +28,6 @@ type Downloader struct {
 	cfg      *config.Config
 	limiter  *limiter.TokenBucket
 	dlStats  *stats.DownloadStats
-	urlIndex atomic.Int64
 	client   *http.Client
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -81,16 +79,7 @@ func (d *Downloader) Stop() {
 	d.cancel()
 }
 
-func (d *Downloader) nextURL() string {
-	if len(d.cfg.DownloadURLs) == 1 {
-		return d.cfg.DownloadURLs[0]
-	}
-	idx := d.urlIndex.Add(1)
-	return d.cfg.DownloadURLs[int(idx)%len(d.cfg.DownloadURLs)]
-}
-
-func (d *Downloader) RunOnce() DownloadResult {
-	url := d.nextURL()
+func (d *Downloader) RunOnce(url string) DownloadResult {
 
 	var lastErr error
 	maxRetries := d.cfg.MaxRetries

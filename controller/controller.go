@@ -15,6 +15,12 @@ import (
 	"fetch-down/stats"
 )
 
+type urlHealth struct {
+	failures  int
+	lastFail  time.Time
+	disabled  bool
+}
+
 type Controller struct {
 	cfg       *config.Config
 	collector *collector.Stats
@@ -25,6 +31,9 @@ type Controller struct {
 	dlStats   *stats.DownloadStats
 
 	stateMu sync.Mutex
+	urlMu   sync.Mutex
+	urlMap  map[string]*urlHealth
+	urlIndex atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,6 +58,7 @@ func New(cfg *config.Config, coll *collector.Stats, dlStats *stats.DownloadStats
 		dlStats:          dlStats,
 		bucket:           bucket,
 		stateMgr:         stateMgr,
+		urlMap:           make(map[string]*urlHealth),
 		ctx:              ctx,
 		cancel:           cancel,
 		windowStart:      time.Now(),
@@ -472,6 +482,76 @@ func (c *Controller) resetWindow() {
 	logger.Info("Window reset complete")
 }
 
+const (
+	urlFailThreshold = 5
+	urlCooldown      = 60 * time.Second
+)
+
+func (c *Controller) recordURLFailure(url string) {
+	c.urlMu.Lock()
+	defer c.urlMu.Unlock()
+
+	h, ok := c.urlMap[url]
+	if !ok {
+		h = &urlHealth{}
+		c.urlMap[url] = h
+	}
+	h.failures++
+	h.lastFail = time.Now()
+	if h.failures >= urlFailThreshold {
+		h.disabled = true
+		logger.Warn("URL disabled after %d failures: %s (cooldown %v)", h.failures, url, urlCooldown)
+	}
+}
+
+func (c *Controller) recordURLSuccess(url string) {
+	c.urlMu.Lock()
+	defer c.urlMu.Unlock()
+
+	if h, ok := c.urlMap[url]; ok {
+		h.failures = 0
+		h.disabled = false
+	}
+}
+
+func (c *Controller) isURLDisabled(url string) bool {
+	c.urlMu.Lock()
+	defer c.urlMu.Unlock()
+
+	h, ok := c.urlMap[url]
+	if !ok {
+		return false
+	}
+	if !h.disabled {
+		return false
+	}
+	if time.Since(h.lastFail) >= urlCooldown {
+		h.disabled = false
+		h.failures = 0
+		logger.Info("URL recovered after cooldown: %s", url)
+		return false
+	}
+	return true
+}
+
+func (c *Controller) pickURL() string {
+	urls := c.cfg.DownloadURLs
+	if len(urls) == 1 {
+		return urls[0]
+	}
+
+	for range urls {
+		idx := c.urlIndex.Add(1)
+		url := urls[int(idx)%len(urls)]
+		if !c.isURLDisabled(url) {
+			return url
+		}
+	}
+
+	idx := c.urlIndex.Add(1)
+	return urls[int(idx)%len(urls)]
+}
+
 func (c *Controller) downloadWorkerPool() {
 	var wg sync.WaitGroup
 
@@ -533,14 +613,20 @@ func (c *Controller) worker(id int) {
 			continue
 		}
 
+		url := c.pickURL()
 		dl := downloader.New(c.cfg, c.bucket, c.getDlStats())
 		if c.cfg.Mode == "traffic" {
 			dl.MaxBytes = c.downloadBudget()
 		}
-		result := dl.RunOnce()
+		result := dl.RunOnce(url)
 
-		if result.Error != nil && c.ctx.Err() == nil {
-			logger.Warn("Worker %d: download error: %v", id, result.Error)
+		if result.Error != nil {
+			if c.ctx.Err() == nil {
+				logger.Warn("Worker %d: download error: %v", id, result.Error)
+			}
+			c.recordURLFailure(url)
+		} else {
+			c.recordURLSuccess(url)
 		}
 
 		select {
