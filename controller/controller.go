@@ -142,9 +142,9 @@ func (c *Controller) Start() {
 
 	switch c.cfg.Mode {
 	case "bandwidth":
-		go c.ratioMode()
+		go c.bandwidthMode()
 	case "traffic":
-		go c.cumulativeMode()
+		go c.trafficMode()
 	}
 
 	go c.statsReporter()
@@ -317,7 +317,7 @@ func (c *Controller) windowDurationRemaining() time.Duration {
 	return remaining
 }
 
-func (c *Controller) ratioMode() {
+func (c *Controller) bandwidthMode() {
 	interval := time.Duration(c.cfg.UplinkSampleInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -334,7 +334,7 @@ func (c *Controller) ratioMode() {
 			bw := c.collector.GetBandwidth()
 
 			if c.collector.IsStale() {
-				logger.Debug("Ratio mode: collector stale, keeping current rate")
+				logger.Debug("Bandwidth mode: collector stale, keeping current rate")
 				continue
 			}
 
@@ -354,7 +354,7 @@ func (c *Controller) ratioMode() {
 				if smoothedRate < 1 {
 					c.bucket.Stop()
 					c.targetWorkers.Store(0)
-					logger.Debug("Ratio mode: uplink near zero, stopping downloads")
+					logger.Debug("Bandwidth mode: uplink near zero, stopping downloads")
 					continue
 				}
 			} else {
@@ -375,13 +375,13 @@ func (c *Controller) ratioMode() {
 				c.targetWorkers.Store(int32(c.cfg.MaxConcurrent))
 			}
 
-			logger.Debug("Ratio mode: up=%.0f B/s, target_down=%.0f B/s, smoothed=%.0f B/s, workers=%d",
+			logger.Debug("Bandwidth mode: up=%.0f B/s, target_down=%.0f B/s, smoothed=%.0f B/s, workers=%d",
 				bw.TxBps, targetDownBps, smoothedRate, c.targetWorkers.Load())
 		}
 	}
 }
 
-func (c *Controller) cumulativeMode() {
+func (c *Controller) trafficMode() {
 	interval := time.Duration(c.cfg.UplinkSampleInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -442,7 +442,7 @@ func (c *Controller) cumulativeMode() {
 				c.targetWorkers.Store(int32(c.cfg.MaxConcurrent))
 			}
 
-			logger.Debug("Cumulative: window_uplink=%d, target=%d, window_down=%d, remaining=%d, rate=%.0f B/s, time_left=%v",
+			logger.Debug("Traffic mode: window_uplink=%d, target=%d, window_down=%d, remaining=%d, rate=%.0f B/s, time_left=%v",
 				windowUplink, targetBytes, windowDownBytes, remaining, requiredRate, c.windowDurationRemaining().Round(time.Second))
 		}
 	}
