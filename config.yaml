@@ -1,0 +1,62 @@
+# Fetch-Down Configuration
+# ========================
+
+# Running mode: "ratio" or "cumulative"
+mode: "ratio"
+
+# --- Ratio Mode Settings ---
+# Target downlink/uplink ratio (e.g., 2.0 means downlink = uplink * 2)
+ratio: 2.0
+
+# --- Cumulative Mode Settings ---
+# Target: total_inbound = total_outbound * multiplier
+cumulative_multiplier: 1.0
+# Time window for cumulative calculation (e.g., "24h", "1h", "30m")
+window_duration: "24h"
+
+# --- Download Settings ---
+# List of download URLs (round-robin selection)
+download_urls:
+  - "http://speedtest.tele2.net/10MB.zip"
+  - "http://speedtest.tele2.net/100MB.zip"
+
+# Maximum concurrent downloads
+max_concurrent: 4
+
+# Total download rate limit in Mbps (0 = unlimited)
+# Set this to avoid saturating the network interface
+bandwidth_limit_mbps: 100
+
+# --- Traffic Collection ---
+# Network interface for uplink monitoring
+# Leave empty for auto-detection
+uplink_interface: "eth0"
+
+# Sampling interval in seconds
+uplink_sample_interval: 1
+
+# --- Connection Settings ---
+# Connection timeout in seconds
+connect_timeout_sec: 10
+
+# Read timeout in seconds
+read_timeout_sec: 30
+
+# Maximum retry attempts (exponential backoff)
+max_retries: 3
+
+# --- Logging ---
+# Log level: "debug", "info", "warn", "error"
+log_level: "info"
+
+# Stats reporting interval in seconds
+stats_interval_sec: 10
+
+# --- State Persistence ---
+# Path to state file for crash/restart recovery
+# Empty string disables persistence (default for ratio mode)
+# Cumulative mode auto-defaults to "fetch-down-state.json" if empty
+state_file: ""
+
+# State auto-save interval in seconds (0 = save only on exit)
+state_save_interval: 60
