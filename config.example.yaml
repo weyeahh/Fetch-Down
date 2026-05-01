@@ -1,14 +1,14 @@
 # Fetch-Down 配置文件
 # ========================
 
-# 运行模式: "ratio"（实时比例）或 "cumulative"（累计流量）
-mode: "ratio"
+# 运行模式: "bandwidth"（带宽模式）或 "traffic"（流量模式）
+mode: "bandwidth"
 
-# --- 比例模式设置 ---
+# --- 带宽模式设置 ---
 # 目标下行/上行比例（如 2.0 表示下行 = 上行 × 2）
 ratio: 2.0
 
-# --- 累计模式设置 ---
+# --- 流量模式设置 ---
 # 目标：入网总流量 = 出网总流量 × 倍数
 cumulative_multiplier: 1.0
 # 时间窗口（支持 Go duration 格式，如 "24h"、"1h"、"30m"）
@@ -54,8 +54,8 @@ stats_interval_sec: 10
 
 # --- 状态持久化 ---
 # 状态文件路径
-# 留空则禁用持久化（比例模式默认禁用）
-# 累计模式留空时自动使用 "fetch-down-state.json"
+# 留空则禁用持久化（带宽模式默认禁用）
+# 流量模式留空时自动使用 "fetch-down-state.json"
 state_file: ""
 
 # 自动保存间隔（秒），0 = 仅退出时保存

@@ -49,10 +49,10 @@ func main() {
 
 	logger.Info("Config: max_concurrent=%d, urls=%d, uplink_interface=%s",
 		cfg.MaxConcurrent, len(cfg.DownloadURLs), coll.Interface())
-	if cfg.Mode == "ratio" {
-		logger.Info("Ratio mode: target down/up ratio = %.2f", cfg.Ratio)
+	if cfg.Mode == "bandwidth" {
+		logger.Info("Bandwidth mode: target down/up ratio = %.2f", cfg.Ratio)
 	} else {
-		logger.Info("Cumulative mode: multiplier=%.2f, window=%s",
+		logger.Info("Traffic mode: multiplier=%.2f, window=%s",
 			cfg.CumulativeMultiplier, cfg.WindowDuration)
 	}
 

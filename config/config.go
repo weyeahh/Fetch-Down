@@ -47,7 +47,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Mode:                 "ratio",
+		Mode:                 "bandwidth",
 		Ratio:                2.0,
 		CumulativeMultiplier: 1.0,
 		WindowDuration:       "24h",
@@ -75,8 +75,8 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	if c.Mode != "ratio" && c.Mode != "cumulative" {
-		return fmt.Errorf("invalid mode %q, must be 'ratio' or 'cumulative'", c.Mode)
+	if c.Mode != "bandwidth" && c.Mode != "traffic" {
+		return fmt.Errorf("invalid mode %q, must be 'bandwidth' or 'traffic'", c.Mode)
 	}
 
 	if len(c.DownloadURLs) == 0 {
@@ -109,11 +109,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("uplink_sample_interval must be >= 1, got %d", c.UplinkSampleInterval)
 	}
 
-	if c.Mode == "ratio" && c.Ratio <= 0 {
+	if c.Mode == "bandwidth" && c.Ratio <= 0 {
 		return fmt.Errorf("ratio must be > 0, got %f", c.Ratio)
 	}
 
-	if c.Mode == "cumulative" && c.CumulativeMultiplier <= 0 {
+	if c.Mode == "traffic" && c.CumulativeMultiplier <= 0 {
 		return fmt.Errorf("cumulative_multiplier must be > 0, got %f", c.CumulativeMultiplier)
 	}
 
@@ -139,7 +139,7 @@ func (c *Config) validate() error {
 		c.StatsIntervalSec = 10
 	}
 
-	if c.StateFile == "" && c.Mode == "cumulative" {
+	if c.StateFile == "" && c.Mode == "traffic" {
 		c.StateFile = "fetch-down-state.json"
 	}
 

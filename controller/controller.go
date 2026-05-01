@@ -85,7 +85,7 @@ func (c *Controller) RestoreState(s *state.PersistedState) {
 
 	c.collector.SetTotalTxBytesBase(s.TotalBytesUp)
 
-	if s.Mode == "cumulative" {
+	if s.Mode == "traffic" {
 		windowDur := c.cfg.WindowDurationParsed()
 		elapsed := time.Since(s.WindowStart)
 
@@ -141,9 +141,9 @@ func (c *Controller) Start() {
 	go c.controlLoop()
 
 	switch c.cfg.Mode {
-	case "ratio":
+	case "bandwidth":
 		go c.ratioMode()
-	case "cumulative":
+	case "traffic":
 		go c.cumulativeMode()
 	}
 
@@ -241,7 +241,7 @@ func (c *Controller) printStats() {
 	uptime := dl.Uptime()
 
 	switch c.cfg.Mode {
-	case "ratio":
+	case "bandwidth":
 		var currentRatio float64
 		if bw.TxBps > 0 {
 			currentRatio = bw.RxBps / bw.TxBps
@@ -251,7 +251,7 @@ func (c *Controller) printStats() {
 			staleIndicator = " [STALE]"
 		}
 		logger.Info(
-			"[STATS] mode=ratio | uptime=%s | up=%s down=%s%s | ratio=%.2f (target=%.2f) | dl_rate=%s | total_down=%s total_up=%s | workers=%d/%d | success=%d failed=%d",
+			"[STATS] mode=bandwidth | uptime=%s | up=%s down=%s%s | ratio=%.2f (target=%.2f) | dl_rate=%s | total_down=%s total_up=%s | workers=%d/%d | success=%d failed=%d",
 			uptime.Round(time.Second),
 			dl.FormatRate(bw.TxBps),
 			dl.FormatRate(bw.RxBps),
@@ -267,7 +267,7 @@ func (c *Controller) printStats() {
 			dl.GetFailedRequests(),
 		)
 
-	case "cumulative":
+	case "traffic":
 		windowUplink := c.collector.GetWindowTxBytes()
 		targetBytes := c.windowTargetBytes.Load()
 		remaining := c.windowDurationRemaining()
@@ -287,7 +287,7 @@ func (c *Controller) printStats() {
 		}
 
 		logger.Info(
-			"[STATS] mode=cumulative | uptime=%s | window_remaining=%s | window_uplink=%s | target_down=%s (%.1f%%) | dl_rate=%s | window_down=%s total_down=%s | workers=%d/%d | success=%d failed=%d",
+			"[STATS] mode=traffic | uptime=%s | window_remaining=%s | window_uplink=%s | target_down=%s (%.1f%%) | dl_rate=%s | window_down=%s total_down=%s | workers=%d/%d | success=%d failed=%d",
 			uptime.Round(time.Second),
 			remaining.Round(time.Second),
 			dl.FormatBytes(int64(windowUplink)),
