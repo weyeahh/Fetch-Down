@@ -73,13 +73,14 @@ jobs:
       - name: Generate next version
         id: version
         run: |
-          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
           if [ -z "$LATEST" ]; then
             TAG="v1.0.0"
           else
-            PATCH=$(echo "$LATEST" | grep -oP '\d+$')
-            PREFIX=$(echo "$LATEST" | grep -oP '^v\d+\.\d+\.')
-            TAG="${PREFIX}$((PATCH + 1))"
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            TAG="${MAJOR}.${MINOR}.$((PATCH + 1))"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Generated version: ${TAG}"
