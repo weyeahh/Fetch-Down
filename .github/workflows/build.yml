@@ -70,13 +70,19 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Generate version tag
+      - name: Generate next version
         id: version
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          TAG="v$(date -u +%Y.%m.%d)-${SHORT_SHA}"
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          if [ -z "$LATEST" ]; then
+            TAG="v1.0.0"
+          else
+            PATCH=$(echo "$LATEST" | grep -oP '\d+$')
+            PREFIX=$(echo "$LATEST" | grep -oP '^v\d+\.\d+\.')
+            TAG="${PREFIX}$((PATCH + 1))"
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Generated tag: ${TAG}"
+          echo "Generated version: ${TAG}"
 
       - name: Create release
         env:
