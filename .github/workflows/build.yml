@@ -2,8 +2,9 @@ name: Build Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -58,16 +59,26 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist/
           merge-multiple: true
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: dist/*
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="latest"
+          TITLE="Latest Build ($(date -u +%Y-%m-%d))"
+          BODY="Auto-built from \`${{ github.ref_name }}@${{ github.sha }}\`"
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber
+            gh release edit "$TAG" --repo "${{ github.repository }}" --title "$TITLE" --notes "$BODY"
+          else
+            gh release create "$TAG" dist/* --repo "${{ github.repository }}" --title "$TITLE" --notes "$BODY" --prerelease --latest
+          fi
